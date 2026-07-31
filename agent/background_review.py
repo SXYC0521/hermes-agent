@@ -291,7 +291,31 @@ _SKILL_REVIEW_PROMPT = (
     "'Nothing to save.' is a real option but should NOT be the "
     "default. If the session ran smoothly with no corrections and "
     "produced no new technique, just say 'Nothing to save.' and stop. "
-    "Otherwise, act."
+    "Otherwise, act.\n\n"
+    "## ⛔ OUTPUT MODE: proposal-only (do not modify files)\n"
+    "You MUST NOT modify any skill files directly. Do NOT call "
+    "skill_manage with action create/update/patch/write_file, and do "
+    "NOT call patch or write_file. Your ONLY allowed tools are: "
+    "skill_view, skills_list, memory.\n"
+    "If you identify a Skill that needs modification, output EXACTLY "
+    "one proposal block in this format (with the ```proposal fences), "
+    "and nothing else after it:\n"
+    "```proposal\n"
+    "target_skill: <skill_name>\n"
+    "change_type: replace_section | patch_section\n"
+    "section_path: <heading path, e.g. '## Pitfalls'>\n"
+    "old_content_hint: <first 50 chars of the section being replaced>\n"
+    "new_content: |\n"
+    "  <full replacement content, self-contained>\n"
+    "reason: <one sentence explaining why>\n"
+    "```\n"
+    "Before writing a proposal, ALWAYS call skill_view(target_skill) "
+    "to read the CURRENT file — old_content_hint must match the file "
+    "as it is now, not your memory of it. Keep new_content "
+    "self-contained; the executor will apply it without conversation "
+    "context. For support-file additions, use change_type=replace_section "
+    "and embed the file content in new_content. If no skill change is "
+    "needed, output exactly: 'No Skill updates required.'"
 )
 
 _COMBINED_REVIEW_PROMPT = (
@@ -383,9 +407,77 @@ _COMBINED_REVIEW_PROMPT = (
     "standalone constraint.\n\n"
     "Act on whichever of the two dimensions has real signal. If "
     "genuinely nothing stands out on either, say 'Nothing to save.' "
-    "and stop — but don't reach for that conclusion as a default."
+    "and stop — but don't reach for that conclusion as a default.\n\n"
+    "## ⛔ SKILL OUTPUT MODE: proposal-only (do not modify files)\n"
+    "For the SKILLS dimension, you MUST NOT modify any skill files "
+    "directly. Do NOT call skill_manage with action "
+    "create/update/patch/write_file, and do NOT call patch or "
+    "write_file. Your ONLY allowed tools are: skill_view, skills_list, "
+    "memory.\n"
+    "If you identify a Skill that needs modification, output EXACTLY "
+    "one proposal block in this format (with the ```proposal fences), "
+    "and nothing else after it:\n"
+    "```proposal\n"
+    "target_skill: <skill_name>\n"
+    "change_type: replace_section | patch_section\n"
+    "section_path: <heading path, e.g. '## Pitfalls'>\n"
+    "old_content_hint: <first 50 chars of the section being replaced>\n"
+    "new_content: |\n"
+    "  <full replacement content, self-contained>\n"
+    "reason: <one sentence explaining why>\n"
+    "```\n"
+    "Before writing a proposal, ALWAYS call skill_view(target_skill) "
+    "to read the CURRENT file — old_content_hint must match the file "
+    "as it is now, not your memory of it. Keep new_content "
+    "self-contained; the executor will apply it without conversation "
+    "context. If no skill change is needed, omit the proposal block."
 )
 
+
+
+def extract_and_save_proposals(review_messages: List[Dict]) -> int:
+    """Extract ```proposal ... ``` blocks from the review agent's final output.
+
+    Writes each proposal to ``~/.hermes/pending_proposals/proposal_*.md``.
+    Returns the number of proposals saved. Best-effort — never raises.
+    """
+    try:
+        import re
+        import time
+        from pathlib import Path
+
+        texts = []
+        for msg in review_messages:
+            if msg.get("role") == "assistant":
+                c = msg.get("content")
+                if isinstance(c, str):
+                    texts.append(c)
+        output = "\n".join(texts)
+        if not output:
+            return 0
+
+        matches = re.findall(r"```proposal\s*\n(.*?)\n```", output, re.DOTALL)
+        if not matches:
+            return 0
+
+        # 写入 Hermes 根目录下的 pending_proposals（全局唯一，供执行器读取）
+        try:
+            from hermes_cli.config import get_hermes_home
+            _root = str(Path(get_hermes_home()))
+        except Exception:
+            _root = str(Path.home() / ".hermes")
+        if "/profiles/" in _root:
+            _root = _root.split("/profiles/")[0]
+        proposals_dir = Path(_root) / "pending_proposals"
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        saved = 0
+        for i, body in enumerate(matches):
+            fname = f"proposal_{int(time.time() * 1000)}_{i}.md"
+            (proposals_dir / fname).write_text(body.strip(), encoding="utf-8")
+            saved += 1
+        return saved
+    except Exception:
+        return 0
 
 
 def summarize_background_review_actions(
@@ -940,6 +1032,19 @@ def _run_review_in_thread(
                     )
                 except Exception:
                     pass
+
+        # Extract skill update proposals (proposal-only mode) and park them
+        # for the async executor. Best-effort — a failure here must not
+        # take down the whole review.
+        try:
+            _proposals_saved = extract_and_save_proposals(review_messages)
+            if _proposals_saved:
+                logger.info(
+                    "Saved %d skill proposal(s) to ~/.hermes/pending_proposals/",
+                    _proposals_saved,
+                )
+        except Exception:
+            pass
 
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
