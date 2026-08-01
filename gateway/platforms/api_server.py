@@ -2516,19 +2516,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key or "",
                 )
         elif session_row_model and not confirmed_runtime_lock:
-            # Session-persisted model (raw string that resolved to no route
-            # alias).  Pins this session's turns ahead of per-request body
-            # values — a session's chosen model is a standing selection,
-            # matching the native gateway's session-model semantics.
-            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
-            provider_runtime = _resolve_provider_runtime(
-                current_provider,
-                target_model=session_row_model,
-                required=False,
-            )
-            if provider_runtime:
-                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
-            model = resolve_effective_model(None, session_row_model, model)
+            # Luma patch: 会话默认 model 别名 "hermes-agent" 会覆盖 profile 已解析的
+            # 真实模型（如 yuexi profile 的 deepseek-ai/DeepSeek-V4-Flash）。
+            # 当会话没有显式持久化模型（仅默认别名）且 profile 已解析出真实模型时，
+            # 保留 profile 模型，不被默认别名覆盖。
+            if session_row_model == "hermes-agent" and model:
+                # 保留 profile 已解析的真实模型，不被会话默认别名覆盖
+                pass
+            else:
+                # Session-persisted model (raw string that resolved to no route
+                # alias).  Pins this session's turns ahead of per-request body
+                # values — a session's chosen model is a standing selection,
+                # matching the native gateway's session-model semantics.
+                current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+                provider_runtime = _resolve_provider_runtime(
+                    current_provider,
+                    target_model=session_row_model,
+                    required=False,
+                )
+                if provider_runtime:
+                    _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+                model = resolve_effective_model(None, session_row_model, model)
             if request_model or request_provider:
                 logger.debug(
                     "api_server request selection skipped: session-persisted model wins for %s",
