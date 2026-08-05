@@ -6407,12 +6407,31 @@ def get_mcp_status() -> List[dict]:
     for name, cfg in configured.items():
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         enabled = _parse_boolish(cfg.get("enabled", True), default=True)
+        # Under multiplexing, per-profile connections live under
+        # ``<server>@<profile>`` keys (see _discover_multiplex_mcp_tools).
+        # A namespaced connection for this server counts as connected — don't
+        # report "configured/failed" just because the bare name isn't a key.
         server = active_servers.get(name)
+        ns_server = None
+        if server is None and _is_multiplex_gateway():
+            _ns_name = f"{name}@"
+            for _key, _srv in active_servers.items():
+                if _key.startswith(_ns_name):
+                    ns_server = _srv
+                    break
+            server = ns_server
         if server and server.session is not None:
+            # Namespaced per-profile connections (register_tools=False) may carry
+            # no registered tool names; report the base server's tool count so
+            # the banner doesn't show "0 tools" for a healthy connection.
+            _tool_src = server
+            _base_srv = active_servers.get(name)
+            if ns_server is not None and _base_srv is not None:
+                _tool_src = _base_srv
             entry = {
                 "name": name,
                 "transport": transport,
-                "tools": len(server._registered_tool_names) if hasattr(server, "_registered_tool_names") else len(server._tools),
+                "tools": len(_tool_src._registered_tool_names) if hasattr(_tool_src, "_registered_tool_names") else len(_tool_src._tools),
                 "connected": True,
                 "disabled": False,
                 "status": "connected",
