@@ -5852,6 +5852,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                         "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                     }
+                    # 向调用方（Luma 前端上下文弹窗）暴露缓存命中 + 上下文遥测。
+                    # cache_read_tokens 与 input/output 同为会话累计；last_prompt_tokens /
+                    # threshold_tokens 让前端进度条以"压缩触发点"为上限，直观反映接近压缩。
+                    usage["cache_read_tokens"] = getattr(agent, "session_cache_read_tokens", 0) or 0
+                    _comp = getattr(agent, "context_compressor", None)
+                    usage["last_prompt_tokens"] = int(getattr(_comp, "last_prompt_tokens", 0) or 0)
+                    usage["context_length"] = int(getattr(_comp, "context_length", 0) or 0)
+                    usage["threshold_tokens"] = int(getattr(_comp, "threshold_tokens", 0) or 0)
+                    usage["compression_count"] = int(getattr(_comp, "compression_count", 0) or 0)
                     # Include the effective session ID in the result so callers
                     # (e.g. X-Hermes-Session-Id header) can track compression-
                     # triggered session rotations. (#16938)
