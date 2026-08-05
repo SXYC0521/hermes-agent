@@ -2112,9 +2112,12 @@ class MCPServerTask:
             # "tool not connected" / stale-handler races during startup
             # notifications. Tools absent from the fresh list are no longer
             # callable, so remove only those stale registry entries first.
-            toolset_name = f"mcp-{self.name}"
+            # Use the base server name: under multiplex, per-profile connections
+            # carry ``<server>@<profile>`` names but share one toolset identity.
+            base_name = _mcp_tool_base_name(self.name)
+            toolset_name = f"mcp-{base_name}"
             stale_tool_names = old_tool_names - {
-                mcp_prefixed_tool_name(self.name, tool.name)
+                mcp_prefixed_tool_name(base_name, tool.name)
                 for tool in new_mcp_tools
             }
             for tool_name in stale_tool_names:
@@ -2129,7 +2132,7 @@ class MCPServerTask:
             # are ambiguous after normalization.
             self._tools = new_mcp_tools
             registered_names = _register_server_tools(
-                self.name, self, self._config
+                base_name, self, self._config
             )
 
             # A previously unique raw name can become ambiguous without changing
@@ -4717,6 +4720,82 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     return server
 
 
+# ---------------------------------------------------------------------------
+# Multiplex per-profile connection routing
+# ---------------------------------------------------------------------------
+# In a multiplexing gateway every profile has its own ``mcp_servers`` config
+# (its own ``X-Luma-Agent``-style identity headers). Profile-specific servers
+# are connected under ``<server>@<profile>`` keys so each agent reaches Luma
+# through its own identity; handlers/check-fns resolve the calling profile at
+# call time and route to the right connection (see ``_discover_multiplex_mcp_tools``).
+
+def _is_multiplex_gateway() -> bool:
+    """Whether this process is running as a profile multiplexer.
+
+    Consults the runtime flag (``set_multiplex_active``), falling back to the
+    ``gateway.multiplex_profiles`` config so the startup discovery pass -- which
+    runs before the runner installs the runtime flag -- still fans out per
+    profile instead of silently registering the default profile only.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+        if is_multiplex_active():
+            return True
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config_readonly
+        gateway_cfg = (load_config_readonly() or {}).get("gateway") or {}
+        return bool(gateway_cfg.get("multiplex_profiles"))
+    except Exception:
+        return False
+
+
+def _current_caller_profile() -> str:
+    """Resolve the calling agent's profile at call/check time.
+
+    Falls back to ``"default"`` when no profile scope is active (e.g. outside
+    a multiplex request, or a single-profile gateway).
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _mcp_tool_base_name(name: str) -> str:
+    """Strip the multiplex ``@profile`` namespace from a server name.
+
+    Per-profile connections live under ``<server>@<profile>`` keys; tool
+    registration / toolset identity always uses the base server name so the
+    visible tool names stay profile-agnostic.
+    """
+    if "@" in name:
+        return name.split("@", 1)[0]
+    return name
+
+
+def _resolve_call_server_name(server_name: str) -> str:
+    """Map a base MCP server name to the calling profile's connection key.
+
+    Under multiplexing, profile-specific servers live under ``<server>@<profile>``.
+    Prefer the caller's connection; fall back to the base name for servers whose
+    config is identical across profiles (shared connection) and for
+    single-profile gateways (where behavior is unchanged).
+    """
+    if not _is_multiplex_gateway():
+        return server_name
+    profile = _current_caller_profile()
+    if not profile:
+        return server_name
+    key = f"{server_name}@{profile}"
+    with _lock:
+        if key in _servers:
+            return key
+    return server_name
+
+
 def _mark_server_call_started(server: Any) -> None:
     """Record a user-visible MCP operation when the server supports it."""
     mark_tool_call = getattr(server, "mark_tool_call", None)
@@ -4724,7 +4803,7 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(base_server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -4732,6 +4811,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Under multiplexing, route to the calling profile's own connection
+        # (keys are namespaced ``<server>@<profile>``). Resolve per call into a
+        # LOCAL so the first caller's namespaced connection never sticks to
+        # this shared handler. Single-profile gateways resolve to the base name
+        # and behave exactly as before.
+        server_name = _resolve_call_server_name(base_server_name)
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -4939,10 +5024,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_list_resources_handler(server_name: str, tool_timeout: float):
+def _make_list_resources_handler(base_server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        server_name = _resolve_call_server_name(base_server_name)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -4995,10 +5081,11 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_read_resource_handler(server_name: str, tool_timeout: float):
+def _make_read_resource_handler(base_server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        server_name = _resolve_call_server_name(base_server_name)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5056,10 +5143,11 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_list_prompts_handler(server_name: str, tool_timeout: float):
+def _make_list_prompts_handler(base_server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        server_name = _resolve_call_server_name(base_server_name)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5117,10 +5205,11 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_get_prompt_handler(server_name: str, tool_timeout: float):
+def _make_get_prompt_handler(base_server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        server_name = _resolve_call_server_name(base_server_name)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5186,8 +5275,11 @@ def _make_check_fn(server_name: str):
     """Return a check function that verifies the MCP connection is alive."""
 
     def _check() -> bool:
+        # Resolve before acquiring _lock: _resolve_call_server_name takes the
+        # same lock and threading.Lock is not reentrant.
+        resolved = _resolve_call_server_name(server_name)
         with _lock:
-            server = _servers.get(server_name)
+            server = _servers.get(resolved)
         return (
             server is not None
             and (server.session is not None or server._is_recycled_stdio())
@@ -5830,8 +5922,15 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     return registered_names
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+async def _discover_and_register_server(
+    name: str, config: dict, register_tools: bool = True
+) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
+
+    When ``register_tools`` is False the server is connected and cached under
+    ``name`` but no tools are registered. Used by multiplex discovery, where
+    per-profile connections are built under ``<server>@<profile>`` keys and
+    tools are registered once per base server name.
 
     Returns list of registered tool names.
     """
@@ -5880,15 +5979,24 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _server_connect_errors.pop(name, None)
         _servers[name] = server
 
-    registered_names = _register_server_tools(name, server, config)
+    if register_tools:
+        registered_names = _register_server_tools(name, server, config)
+    else:
+        registered_names = []
     server._registered_tool_names = list(registered_names)
 
     transport_type = "HTTP" if "url" in config else "stdio"
-    logger.info(
-        "MCP server '%s' (%s): registered %d tool(s): %s",
-        name, transport_type, len(registered_names),
-        ", ".join(registered_names),
-    )
+    if register_tools:
+        logger.info(
+            "MCP server '%s' (%s): registered %d tool(s): %s",
+            name, transport_type, len(registered_names),
+            ", ".join(registered_names),
+        )
+    else:
+        logger.info(
+            "MCP server '%s' (%s): connected (tools deferred to base registration)",
+            name, transport_type,
+        )
     return registered_names
 
 
@@ -6034,6 +6142,143 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
+def _discover_multiplex_mcp_tools() -> List[str]:
+    """Multiplex-aware MCP discovery: one connection per profile identity.
+
+    Each profile configures its own ``mcp_servers`` (its own
+    ``X-Luma-Agent``-style identity headers). Profile-specific servers are
+    connected under ``<server>@<profile>`` keys so every agent reaches the MCP
+    endpoint through its own identity; servers whose resolved config is
+    identical across all profiles stay on a single shared connection. Tools are
+    registered once per base server name (visible tool names unchanged);
+    ``_resolve_call_server_name`` routes each call to the calling profile's
+    connection.
+    """
+    from hermes_cli.profiles import profiles_to_serve
+    from gateway.run import _profile_runtime_scope
+
+    try:
+        serve = profiles_to_serve(multiplex=True)
+    except Exception as exc:
+        logger.debug("Multiplex MCP discovery: profiles_to_serve failed: %s", exc)
+        return []
+
+    # Phase 1: load each profile's mcp_servers within its own profile scope.
+    per_profile: Dict[str, Dict[str, dict]] = {}  # base -> {profile: config}
+    for profile_name, profile_home in serve:
+        try:
+            with _profile_runtime_scope(profile_home):
+                servers = _load_mcp_config()
+        except Exception as exc:
+            logger.debug(
+                "Multiplex MCP discovery: profile '%s' scope failed: %s",
+                profile_name, exc,
+            )
+            continue
+        for base, cfg in servers.items():
+            per_profile.setdefault(base, {})[profile_name] = cfg
+
+    if not per_profile:
+        logger.debug("No MCP servers configured (multiplex)")
+        return []
+
+    # Phase 2: decide connection keys and the representative config used to
+    # register each base server's tools once.
+    new_servers: Dict[str, dict] = {}    # connection key -> config
+    base_repr: Dict[str, str] = {}       # base -> representative connection key
+    base_repr_cfg: Dict[str, dict] = {}  # base -> representative config
+    for base, profile_map in per_profile.items():
+        distinct = {
+            json.dumps(cfg, sort_keys=True, ensure_ascii=False, default=str)
+            for cfg in profile_map.values()
+        }
+        if len(distinct) == 1:
+            # Identical config across profiles -> one shared connection.
+            prof = next(iter(profile_map))
+            base_repr[base] = base
+            base_repr_cfg[base] = profile_map[prof]
+            if base not in _servers and not _connect_cooldown_active(base):
+                new_servers[base] = profile_map[prof]
+        else:
+            # Profile-specific config (own headers) -> one connection each.
+            prof = "default" if "default" in profile_map else next(iter(profile_map))
+            base_repr[base] = f"{base}@{prof}"
+            base_repr_cfg[base] = profile_map[prof]
+            for prof_name, cfg in profile_map.items():
+                nkey = f"{base}@{prof_name}"
+                if nkey not in _servers and not _connect_cooldown_active(nkey):
+                    new_servers[nkey] = cfg
+
+    if not new_servers:
+        return _existing_tool_names()
+
+    _ensure_mcp_loop()
+    with _lock:
+        _server_connecting.update(new_servers)
+
+    async def _discover_all():
+        server_names = list(new_servers.keys())
+        results = await asyncio.gather(
+            *(
+                _discover_and_register_server(n, cfg, register_tools=False)
+                for n, cfg in new_servers.items()
+            ),
+            return_exceptions=True,
+        )
+        for name, result in zip(server_names, results):
+            if isinstance(result, BaseException):
+                command = new_servers.get(name, {}).get("command")
+                message = _format_connect_error(result)
+                with _lock:
+                    _server_connecting.discard(name)
+                    _server_connect_errors[name] = message
+                    _record_connect_failure(name)
+                logger.warning(
+                    "Failed to connect to MCP server '%s'%s: %s",
+                    name,
+                    f" (command={command})" if command else "",
+                    message,
+                )
+            else:
+                with _lock:
+                    _server_connecting.discard(name)
+                    _server_connect_errors.pop(name, None)
+                    _clear_connect_failure(name)
+
+    from tools.interrupt import is_interrupted as _is_interrupted, set_interrupt as _set_interrupt
+    _was_interrupted = _is_interrupted()
+    if _was_interrupted:
+        _set_interrupt(False)
+    try:
+        _run_on_mcp_loop(_discover_all, timeout=120)
+    finally:
+        if _was_interrupted:
+            _set_interrupt(True)
+
+    # Phase 3: register each base server's tools once via its representative.
+    for base, key in base_repr.items():
+        server = _servers.get(key)
+        if server is None or server.session is None:
+            continue
+        cfg = base_repr_cfg.get(base) or {}
+        registered = _register_server_tools(base, server, cfg)
+        server._registered_tool_names = list(registered)
+        if _parse_boolish(cfg.get("supports_parallel_tool_calls", False), default=False):
+            _parallel_safe_servers.add(base)
+        else:
+            _parallel_safe_servers.discard(base)
+
+    with _lock:
+        connected_count = sum(
+            1 for n in new_servers if n in _servers and n not in _server_connect_errors
+        )
+    logger.info(
+        "MCP (multiplex): %d/%d server connection(s) up across %d profile(s)",
+        connected_count, len(new_servers), len(serve),
+    )
+    return _existing_tool_names()
+
+
 def discover_mcp_tools() -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
@@ -6043,12 +6288,18 @@ def discover_mcp_tools() -> List[str]:
     Idempotent for already-connected servers. If some servers failed on a
     previous call, only the missing ones are retried.
 
+    In a multiplexing gateway, discovery fans out per profile instead
+    (``_discover_multiplex_mcp_tools``).
+
     Returns:
         List of all registered MCP tool names.
     """
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
+
+    if _is_multiplex_gateway():
+        return _discover_multiplex_mcp_tools()
 
     servers = _load_mcp_config()
     if not servers:
