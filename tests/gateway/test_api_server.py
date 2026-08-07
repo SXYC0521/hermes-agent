@@ -2618,3 +2618,86 @@ class TestCreateAgentModelRecovery:
         assert captured[1]["model"] == "minimax/minimax-m3"
 
 
+# ---------------------------------------------------------------------------
+# _response_messages_turn_start_index / _turn_transcript_messages
+# ---------------------------------------------------------------------------
+
+
+class TestTurnTranscriptSlicing:
+    """run.completed must carry only the current turn's assistant/tool messages.
+
+    Regression: when the exact-prefix match against conversation_history fails
+    (system prompt injected at the head of the run transcript, history reshaped
+    by compression, user content normalized, ...), the turn start used to fall
+    back to ``0`` — leaking the *whole* session transcript into every
+    run.completed, so each stored message showed the session-wide accumulated
+    tool calls.
+    """
+
+    def _messages(self):
+        prior = [
+            {"role": "user", "content": "旧问题"},
+            {"role": "assistant", "content": "旧答"},
+        ]
+        current = {"role": "user", "content": "帮我查一下"}
+        turn = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_new", "function": {"name": "claude_code_research",
+                                                "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_new", "content": "结果"},
+        ]
+        return prior, current, turn
+
+    def test_prefix_match_returns_expected_start(self):
+        prior, current, turn = self._messages()
+        full = list(prior) + [current] + list(turn)
+        # conversation_history includes the current user message (state.db
+        # already persisted it) → expected_prefix = prior + [current_user]
+        history = list(prior) + [current]
+        start = APIServerAdapter._response_messages_turn_start_index(
+            history, "帮我查一下", {"messages": full}
+        )
+        assert start == len(prior) + 1  # right after the current user message
+        assert full[start:] == turn
+
+    def test_prefix_mismatch_falls_back_to_last_user_message(self):
+        """System prompt injected at the head → prefix can't match → must still
+        find the current turn boundary instead of leaking the whole session."""
+        prior, current, turn = self._messages()
+        full = [{"role": "system", "content": "你是助手"}] + list(prior) + [current] + list(turn)
+        start = APIServerAdapter._response_messages_turn_start_index(
+            prior, "帮我查一下", {"messages": full}
+        )
+        # system(0) + prior(1..2) + user(3) → turn begins at 4
+        assert start == len(prior) + 2
+        assert full[start:] == turn
+
+    def test_current_turn_only_messages_returns_zero(self):
+        """Transcript that is already current-turn-only (no user message) must
+        not regress: start=0 slices from the beginning, which is correct."""
+        prior, current, turn = self._messages()
+        start = APIServerAdapter._response_messages_turn_start_index(
+            list(prior) + [current], "帮我查一下", {"messages": list(turn)}
+        )
+        assert start == 0
+
+    def test_empty_messages_returns_zero(self):
+        assert APIServerAdapter._response_messages_turn_start_index([], "hi", {"messages": []}) == 0
+        assert APIServerAdapter._response_messages_turn_start_index([], "hi", {}) == 0
+
+    def test_turn_transcript_does_not_leak_prior_tool_calls(self):
+        """End-to-end through _turn_transcript_messages: the emitted per-turn
+        transcript must contain this turn's tool call but none from prior
+        turns, even when the prefix match fails."""
+        prior, current, turn = self._messages()
+        full = [{"role": "system", "content": "sys"}] + list(prior) + [current] + list(turn)
+        transcript = APIServerAdapter._turn_transcript_messages(prior, "帮我查一下", {"messages": full})
+        blob = json.dumps(transcript)
+        assert "call_new" in blob
+        assert "claude_code_research" in blob
+        # Prior turn had no tool calls here; assert no leakage via a distinct marker
+        assert "旧答" not in blob
+        assert all(m.get("role") in {"assistant", "tool"} for m in transcript)
+
+

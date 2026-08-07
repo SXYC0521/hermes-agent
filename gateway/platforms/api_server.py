@@ -5592,7 +5592,15 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message: Any,
         result: Dict[str, Any],
     ) -> int:
-        """Detect transcript-shaped result["messages"] and return turn start."""
+        """Detect transcript-shaped result["messages"] and return turn start.
+
+        Returns the index in ``result["messages"]`` where the current turn
+        begins (i.e. right after the current user message).  Callers slice
+        ``agent_messages[start:]`` to emit only this turn's assistant/tool
+        messages; returning 0 leaks the *whole* session transcript, so every
+        run.completed carries the session-wide accumulated tool calls and each
+        client re-stores the same stale tool list on every message.
+        """
         agent_messages = result.get("messages") if isinstance(result, dict) else None
         if not isinstance(agent_messages, list) or not agent_messages:
             return 0
@@ -5604,6 +5612,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return len(expected_prefix)
         if prior and agent_messages[:len(prior)] == prior:
             return len(prior)
+
+        # Prefix match failed (system prompt injected at the head, history
+        # reshaped by compression, user content normalized, etc.).  A run
+        # transcript always ends with this turn's user message, so fall back to
+        # "everything after the last user message" instead of leaking the whole
+        # session as "this turn".
+        for i in range(len(agent_messages) - 1, -1, -1):
+            msg = agent_messages[i]
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                return i + 1
         return 0
 
     @classmethod
