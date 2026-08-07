@@ -6101,6 +6101,62 @@ def run_conversation(
                     except Exception:
                         pass
 
+                # ── Before-tool compression trigger ──────────────────────────────
+                # When enabled, compact BEFORE executing this tool batch once the
+                # live context (last API-reported prompt tokens) exceeds
+                # before_tool_threshold_tokens, so the tool results land in a
+                # shorter context and the next LLM request doesn't carry a long
+                # transcript. Distinct from the post-response / pre-API triggers
+                # (both fire AFTER tools already ran); this is the only seam that
+                # shrinks context before the batch executes. Cooldown + anti-thrash
+                # guards are shared via should_compress(threshold=...).
+                _cc = agent.context_compressor
+                if (
+                    getattr(agent, "_compress_before_tool_enabled", False)
+                    and _cc is not None
+                    and getattr(_cc, "last_prompt_tokens", 0) > 0
+                    and compression_attempts < max_compression_attempts
+                ):
+                    _bt_tokens = _cc.last_prompt_tokens
+                    _bt_threshold = (
+                        getattr(agent, "_before_tool_threshold_tokens", 0)
+                        or getattr(_cc, "threshold_tokens", 0)
+                    )
+                    if _bt_threshold and _cc.should_compress(
+                        _bt_tokens, threshold=_bt_threshold
+                    ):
+                        compression_attempts += 1
+                        agent._safe_print(
+                            f"  ⟳ compacting context before tool call "
+                            f"({_bt_tokens:,} >= {_bt_threshold:,})…"
+                        )
+                        _bt_target = getattr(agent, "_before_tool_target_ratio", None)
+                        _orig_ratio = getattr(_cc, "summary_target_ratio", None)
+                        try:
+                            if _bt_target is not None and _orig_ratio is not None:
+                                _cc.summary_target_ratio = _bt_target
+                                _cc._tail_token_budget = None
+                            _pre_tool_input = messages
+                            messages, active_system_prompt = agent._compress_context(
+                                messages, system_message,
+                                approx_tokens=_bt_tokens,
+                                task_id=effective_task_id,
+                            )
+                        finally:
+                            if _bt_target is not None and _orig_ratio is not None:
+                                _cc.summary_target_ratio = _orig_ratio
+                                _cc._tail_token_budget = None
+                        if (
+                            messages is _pre_tool_input
+                            and compression_skipped_due_to_lock(agent)
+                        ):
+                            # Lock held by another path — refund this attempt.
+                            compression_attempts -= 1
+                        else:
+                            conversation_history = conversation_history_after_compression(
+                                agent, messages, conversation_history
+                            )
+
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if getattr(agent, "_incremental_persistence_failed", False):

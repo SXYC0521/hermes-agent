@@ -2351,7 +2351,7 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int = None, *, threshold: int = None) -> bool:
         """Check if context exceeds the compression threshold.
 
         Returns ``True`` when compression should run now. For the caller-facing
@@ -2362,12 +2362,18 @@ class ContextCompressor(ContextEngine):
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
+
+        ``threshold``: optional override for the comparison threshold. Defaults
+        to ``self.threshold_tokens`` (the normal automatic-compaction trigger).
+        A caller that wants a *different* trigger (e.g. compress before tool
+        calls once the context exceeds a lower, dedicated threshold) passes it
+        here; cooldown / anti-thrash guards still apply as usual.
         """
-        decision, _reason = self.should_compress_info(prompt_tokens)
+        decision, _reason = self.should_compress_info(prompt_tokens, threshold=threshold)
         return decision
 
     def should_compress_info(
-        self, prompt_tokens: int = None
+        self, prompt_tokens: int = None, *, threshold: int = None
     ) -> "tuple[bool, str | None]":
         """Check if context exceeds the compression threshold.
 
@@ -2393,7 +2399,8 @@ class ContextCompressor(ContextEngine):
         where each pass removes only 1-2 messages.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
-        if tokens < self.threshold_tokens:
+        _threshold = threshold if threshold is not None else self.threshold_tokens
+        if tokens < _threshold:
             return False, None
         if self._automatic_compression_blocked():
             return False, self._compression_block_reason() or "blocked"

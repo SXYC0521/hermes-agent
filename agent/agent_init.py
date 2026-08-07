@@ -1916,6 +1916,34 @@ def init_agent(
             _compression_cfg.get("proactive_prune_min_reclaim_tokens", 4096), 4096
         ),
     )
+    # Opt-in "compress before tool calls" trigger: when the live context
+    # (last API-reported prompt tokens) already exceeds
+    # ``before_tool_threshold_tokens``, compact BEFORE executing the batch so
+    # the tool results land in a shorter context and the following LLM request
+    # does not carry a long transcript. Distinct from the normal automatic
+    # trigger (``threshold``); this is a dedicated lower trigger for tool-heavy
+    # rounds. Disabled by default — an unset key is behavior-neutral.
+    agent._compress_before_tool_enabled = str(
+        _compression_cfg.get("compress_before_tool_calls", False)
+    ).lower() in {"true", "1", "yes"}
+    # Absolute token trigger for the before-tool compression. 0 / unset means
+    # fall back to the normal ``threshold_tokens`` (i.e. the before-tool check
+    # behaves like the regular one).
+    agent._before_tool_threshold_tokens = max(
+        0, _parse_prune_int(_compression_cfg.get("before_tool_threshold_tokens", 0), 0)
+    )
+    # Optional compression target ratio for the before-tool pass. None = reuse
+    # the shared ``target_ratio``. When set, this pass compacts down to
+    # ``threshold_tokens * before_tool_target_ratio`` instead.
+    _bt_ratio_raw = _compression_cfg.get("before_tool_target_ratio")
+    agent._before_tool_target_ratio = None
+    if _bt_ratio_raw is not None:
+        try:
+            agent._before_tool_target_ratio = max(
+                0.10, min(float(_bt_ratio_raw), 0.80)
+            )
+        except (TypeError, ValueError):
+            agent._before_tool_target_ratio = None
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of
