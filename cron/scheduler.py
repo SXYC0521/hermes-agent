@@ -282,7 +282,12 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    enqueue_pending_delivery,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1447,7 +1452,13 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    execution_id: Optional[str] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1533,6 +1544,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         return msg
 
     delivery_errors = []
+
+    # 薄转发架构：api_server 目标无法被 push（send() 永远失败），到点把触发内容
+    # 持久化进 pending_deliveries，由 Luma 轮询拉取后 chat_sync 唤起。幂等入队，
+    # 独立于 jobs.json 存活——一次性 job 移除后记录仍在，唤醒不丢。
+    for target in targets:
+        if str(target.get("platform", "")).lower() == "api_server":
+            _exec_key = execution_id or (
+                f"{job['id']}::{target.get('chat_id', '?')}::{int(time.time())}"
+            )
+            try:
+                enqueue_pending_delivery(
+                    _exec_key, job["id"], "api_server",
+                    target.get("chat_id", ""), delivery_content,
+                )
+            except Exception as _e:
+                logger.warning(
+                    "Job '%s': enqueue pending delivery failed: %s", job["id"], _e,
+                )
 
     for target in targets:
         platform_name = target["platform"]
@@ -4008,7 +4037,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     and not _resolve_delivery_targets(job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(
+                        job, deliver_content, adapters=adapters, loop=loop,
+                        execution_id=execution_id,
+                    )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)

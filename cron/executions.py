@@ -7,6 +7,7 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
+import datetime
 import os
 import sqlite3
 import threading
@@ -59,6 +60,28 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
+    )
+    # pending_deliveries：api_server 目标（薄转发架构，无法 push）的 cron 触发内容，
+    # 由 Luma 轮询拉取后 chat_sync 唤起。独立于 jobs.json 存活——一次性 job 移除后
+    # 记录仍在，唤醒不丢。不是重试队列：claim 后由 Luma ack。
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS pending_deliveries (
+             id           TEXT PRIMARY KEY,
+             execution_id TEXT NOT NULL,
+             job_id       TEXT NOT NULL,
+             platform     TEXT NOT NULL,
+             chat_id      TEXT NOT NULL,
+             content      TEXT NOT NULL,
+             status       TEXT NOT NULL DEFAULT 'pending',
+             created_at   TEXT NOT NULL,
+             claimed_at   TEXT,
+             acked_at     TEXT,
+             UNIQUE (execution_id, chat_id)
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pd_status "
+        "ON pending_deliveries(status, claimed_at)"
     )
 
 
@@ -278,3 +301,103 @@ def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             clean,
         ).fetchall()
     return {row["job_id"]: dict(row) for row in rows}
+
+
+# ══════════════════════════════════════════════════════════════
+# pending_deliveries：api_server 目标（薄转发，无法 push）的 cron 触发内容。
+# Luma 轮询 claim → chat_sync 唤起 → ack；claim 后超 TTL 自动翻回（at-least-once）。
+# ══════════════════════════════════════════════════════════════
+
+
+def _iso_minus(iso_str: str, seconds: int) -> str:
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str)
+        return (dt - datetime.timedelta(seconds=seconds)).isoformat()
+    except Exception:
+        return iso_str
+
+
+def enqueue_pending_delivery(
+    execution_id: Optional[str],
+    job_id: str,
+    platform: str,
+    chat_id: str,
+    content: str,
+) -> Dict[str, Any]:
+    """入队一条待 Luma 拉取的投递（幂等：同一 execution+chat_id 只入一条）。"""
+    now = _hermes_now().isoformat()
+    delivery_id = uuid.uuid4().hex
+    with _transaction() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO pending_deliveries
+               (id, execution_id, job_id, platform, chat_id, content,
+                status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
+            (delivery_id, str(execution_id or ""), str(job_id), str(platform),
+             str(chat_id), str(content), now),
+        )
+        inserted = cur.rowcount == 1
+        row = conn.execute(
+            "SELECT * FROM pending_deliveries WHERE id=?", (delivery_id,)
+        ).fetchone()
+    record = _record(row)
+    return record if record is not None else {"id": delivery_id, "inserted": False}
+
+
+def claim_pending_deliveries(
+    limit: int = 50,
+    stale_ttl_seconds: int = 600,
+) -> List[Dict[str, Any]]:
+    """原子认领待投递：先把超 TTL 的 claimed 翻回 pending（崩溃恢复），
+    再返回 up to limit 条 pending 并标记 claimed（claim-on-read）。"""
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        conn.execute(
+            "UPDATE pending_deliveries SET status='pending', claimed_at=NULL "
+            "WHERE status='claimed' AND claimed_at IS NOT NULL AND claimed_at < ?",
+            (_iso_minus(now, max(1, int(stale_ttl_seconds))),),
+        )
+        rows = conn.execute(
+            "SELECT * FROM pending_deliveries WHERE status='pending' "
+            "ORDER BY created_at ASC LIMIT ?",
+            (max(1, min(int(limit), 200)),),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE pending_deliveries SET status='claimed', claimed_at=? "
+                f"WHERE id IN ({placeholders})",
+                (now, *ids),
+            )
+    return [dict(r) for r in rows]
+
+
+def ack_pending_deliveries(ids: Optional[List[str]]) -> int:
+    """确认投递完成（Luma chat_sync 成功后调用）→ acked，随后清理过期 acked。"""
+    clean = [str(i) for i in (ids or []) if str(i).strip()]
+    if not clean:
+        return 0
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        placeholders = ",".join("?" for _ in clean)
+        cur = conn.execute(
+            f"UPDATE pending_deliveries SET status='acked', acked_at=? "
+            f"WHERE id IN ({placeholders}) AND status='claimed'",
+            (now, *clean),
+        )
+        acked = cur.rowcount
+    prune_acked_pending_deliveries(older_than_days=7)
+    return acked
+
+
+def prune_acked_pending_deliveries(older_than_days: int = 7) -> int:
+    """清理已 ack 超过 N 天的记录（表有界）。"""
+    cutoff = _iso_minus(_hermes_now().isoformat(), max(1, int(older_than_days)) * 86400)
+    with _transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM pending_deliveries WHERE status='acked' "
+            "AND acked_at IS NOT NULL AND acked_at < ?",
+            (cutoff,),
+        )
+        return cur.rowcount

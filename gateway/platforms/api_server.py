@@ -1114,6 +1114,10 @@ try:
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
     )
+    from cron.executions import (
+        claim_pending_deliveries as _cron_claim_pending,
+        ack_pending_deliveries as _cron_ack_pending,
+    )
     _CRON_AVAILABLE = True
 except ImportError:
     _cron_list = None
@@ -1124,6 +1128,8 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_claim_pending = None
+    _cron_ack_pending = None
 
 
 def _notify_cron_provider_jobs_changed() -> None:
@@ -1851,6 +1857,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
+            # 薄转发架构：api_server 目标无法被 push，触发内容进 pending_deliveries，
+            # 由 Luma 轮询拉取（claim-on-read）→ chat_sync 唤起 → ack。
+            routes.append(("GET", "/api/cron/pending", self._handle_cron_pending))
+            routes.append(("POST", "/api/cron/pending/ack", self._handle_cron_pending_ack))
         return routes
 
     # ------------------------------------------------------------------
@@ -5270,6 +5280,44 @@ class APIServerAdapter(BasePlatformAdapter):
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_cron_pending(self, request: "web.Request") -> "web.Response":
+        """GET /api/cron/pending — claim-and-return pending api_server cron deliveries.
+
+        薄转发架构：api_server 目标无法被 push，cron 触发内容落在
+        pending_deliveries，Luma 轮询本端点（claim-on-read）→ chat_sync 唤起
+        → POST /api/cron/pending/ack 确认。
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        try:
+            limit = self._parse_nonnegative_int(request.query.get("limit"), 50, 200)
+            pending = _cron_claim_pending(limit=limit)
+            return web.json_response({"pending": pending})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_cron_pending_ack(self, request: "web.Request") -> "web.Response":
+        """POST /api/cron/pending/ack — confirm pending cron deliveries delivered."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        try:
+            body = await request.json()
+            ids = body.get("ids") or []
+            if isinstance(ids, str):
+                ids = [ids]
+            acked = _cron_ack_pending([str(i) for i in ids])
+            return web.json_response({"acked": acked})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
