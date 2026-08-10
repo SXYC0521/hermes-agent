@@ -2619,6 +2619,154 @@ class TestCreateAgentModelRecovery:
 
 
 # ---------------------------------------------------------------------------
+# per-request api_mode override（前端档位跨协议切换：qnaigc Claude↔GLM 等）
+# ---------------------------------------------------------------------------
+
+
+class TestRequestApiModeOverride:
+    """runtime_kwargs 的 api_mode 来自 profile 默认解析；请求显式指定
+    ``requested_api_mode`` 时须无条件胜出（_RUNTIME_AGENT_OVERRIDE_KEYS 已含 api_mode）。"""
+
+    def test_request_agent_overrides_extracts_api_mode(self):
+        overrides = _request_agent_overrides(
+            {"model": "glm-5.2", "api_mode": "chat_completions"}
+        )
+        assert overrides["requested_api_mode"] == "chat_completions"
+        # 未指定 api_mode 时不产生 override（向后兼容）
+        assert "requested_api_mode" not in _request_agent_overrides({"model": "x"})
+
+    def test_request_agent_overrides_fires_for_default_model(self):
+        """切回默认档位：model == virtual_model 也要触发覆盖。
+
+        会话可能被 AIAgent 的 create_session 回填钉住本轮模型；若默认模型请求不
+        触发覆盖，会被会话钉住的非默认模型压掉，切不回默认档位。
+        """
+        overrides = _request_agent_overrides(
+            {"model": "claude-sonnet-4-6"}, virtual_model="claude-sonnet-4-6",
+        )
+        assert overrides["requested_model"] == "claude-sonnet-4-6"
+
+    def test_bare_model_still_gated_when_disallowed(self):
+        """allow_bare_model=False（OpenAI 兼容面）仍不产生裸 model 覆盖。"""
+        overrides = _request_agent_overrides(
+            {"model": "claude-sonnet-4-6"}, virtual_model="claude-sonnet-4-6",
+            allow_bare_model=False,
+        )
+        assert "requested_model" not in overrides
+
+    def test_request_agent_overrides_extracts_base_url(self):
+        overrides = _request_agent_overrides(
+            {"model": "deepseek-v4-flash", "base_url": "https://api.qnaigc.com/v1"}
+        )
+        assert overrides["requested_base_url"] == "https://api.qnaigc.com/v1"
+        assert "requested_base_url" not in _request_agent_overrides({"model": "x"})
+
+    def test_create_agent_applies_requested_api_mode_and_base_url(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        # provider runtime 解析出 chat_completions + 默认 base_url；请求显式覆盖须胜出
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+            lambda provider, target_model=None: {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.ai/api/v1",
+            },
+        )
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        adapter._create_agent(
+            session_id="s1",
+            requested_model="claude-sonnet-4-6",
+            requested_api_mode="anthropic_messages",
+            requested_base_url="https://api.qnaigc.com",
+        )
+
+        assert captured["api_mode"] == "anthropic_messages"
+        assert captured["base_url"] == "https://api.qnaigc.com"
+        assert captured["model"] == "claude-sonnet-4-6"
+
+    def test_per_request_model_beats_session_persisted(self, monkeypatch):
+        """会话钉住的模型不得压住每请求显式覆盖（前端档位切换）。
+
+        AIAgent 会把本轮模型持久化回会话行（standing choice）；若会话钉的
+        claude-sonnet-4-6 压住每请求 glm-5.2，档位切换就失效。
+        """
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+            lambda provider, target_model=None: {
+                "provider": "openrouter", "api_mode": "chat_completions",
+            },
+        )
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        adapter._create_agent(
+            session_id="s1",
+            session_model="claude-sonnet-4-6",  # 会话钉住 Claude
+            requested_model="glm-5.2",           # 每请求切 glm
+            requested_provider="volc-ark",
+        )
+
+        assert captured["model"] == "glm-5.2"
+
+
+class TestSessionCreateNoBakedDefaultModel:
+    """薄转发（Luma）建会话不传 model 时不得烘焙 profile 默认。
+
+    否则默认被当作 session-persisted model 钉住会话，压掉每请求 model 覆盖——
+    前端档位切换（light/balanced/heavy）会完全失效（2026-08-10 实际踩坑）。
+    只烘焙客户端**显式**选择的模型（POST /api/sessions {"model": ...}）。
+    """
+
+    async def _create_session(self, tmp_path, body):
+        import json
+
+        from aiohttp.test_utils import make_mocked_request
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        adapter = _make_adapter()  # 无 key → _check_auth 放行（测试/手动接线行为）
+        adapter._session_db = db
+
+        async def fake_read_json_body(request):
+            return body, None
+
+        adapter._read_json_body = fake_read_json_body
+        req = make_mocked_request("POST", "/api/sessions")
+        resp = await adapter._handle_create_session(req)
+        assert resp.status == 201
+        return json.loads(resp.body.decode())
+
+    @pytest.mark.asyncio
+    async def test_without_model_stores_empty_model(self, tmp_path):
+        body = await self._create_session(tmp_path, {"id": "luma_yan-yi_2026-08-10"})
+        # 未显式指定 model → 会话不烘焙默认（None/空），每请求覆盖才不被压掉
+        assert body["session"]["model"] in (None, "")
+
+    @pytest.mark.asyncio
+    async def test_with_explicit_model_bakes_it(self, tmp_path):
+        body = await self._create_session(tmp_path, {"id": "s2", "model": "glm-5.2"})
+        # 显式指定 → 烘焙为会话 standing choice（会话级钉住）
+        assert body["session"]["model"] == "glm-5.2"
+
+
+# ---------------------------------------------------------------------------
 # _response_messages_turn_start_index / _turn_transcript_messages
 # ---------------------------------------------------------------------------
 

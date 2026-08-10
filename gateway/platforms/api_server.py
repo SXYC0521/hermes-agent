@@ -190,6 +190,21 @@ def _clean_request_string(value: Any) -> Optional[str]:
     return cleaned or None
 
 
+def _runtime_has_usable_key(runtime: Optional[Dict[str, Any]]) -> bool:
+    """provider runtime 是否带可用 api_key。
+
+    解析失败会落到通用默认（如 openrouter）且 api_key 为 None / "no-key-required"；
+    此时用它对 runtime_kwargs 做 override 会毁掉 profile 已解析好的凭据
+    （Authorization 变 Bearer None，上游 401）。有可用 key 才允许覆盖。
+    """
+    if not isinstance(runtime, dict):
+        return False
+    key = runtime.get("api_key")
+    if not key:
+        return False
+    return str(key) != "no-key-required"
+
+
 def _request_reasoning_config(model_options: Any) -> Optional[Dict[str, Any]]:
     """Translate browser/API model_options into AIAgent reasoning_config.
 
@@ -324,8 +339,24 @@ def _request_agent_overrides(
     if provider:
         overrides["requested_provider"] = provider
 
+    # 每请求 api_mode 覆盖（前端档位跨协议切换：同一端点 Claude↔GLM 等）。
+    # runtime_kwargs 的 api_mode 来自 profile 默认解析，请求显式指定则无条件胜出。
+    api_mode = _clean_request_string(body.get("api_mode"))
+    if api_mode:
+        overrides["requested_api_mode"] = api_mode
+
+    # 每请求 base_url 覆盖（档位切协议时端点可能不同，如 qnaigc anthropic 走裸域名、
+    # chat_completions 走 /v1）。api_key 仍走 profile 配置，不随请求透传。
+    base_url = _clean_request_string(body.get("base_url"))
+    if base_url:
+        overrides["requested_base_url"] = base_url
+
     model = _clean_request_string(body.get("model"))
-    if model and model != virtual_model and (provider or allow_bare_model):
+    # 不再要求 model != virtual_model：会话可能被 AIAgent 的 create_session 回填钉住
+    # 本轮模型（hermes_state._insert_session_row 的 COALESCE），切回"默认档位"时
+    # model == virtual_model 若不触发覆盖会被会话钉住的非默认模型压掉。显式请求
+    # 默认模型结果本就是这个默认，唯一新效果是压过会话钉住，安全。
+    if model and (provider or allow_bare_model):
         overrides["requested_model"] = model
 
     model_options = body.get("model_options")
@@ -2366,6 +2397,8 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
+        requested_api_mode: Optional[str] = None,
+        requested_base_url: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
@@ -2525,7 +2558,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     "api_server request selection skipped: session /model override wins for %s",
                     session_key or "",
                 )
-        elif session_row_model and not confirmed_runtime_lock:
+        elif (
+            session_row_model
+            and not confirmed_runtime_lock
+            # 每请求显式 model/provider 优先于会话钉住的模型。AIAgent 会把本轮模型
+            # 持久化回会话行（"standing choice"），前端档位切换若不跳过会让切档失效
+            # （会话钉 glm-5.2 压掉用户切回 claude 的请求）。仅当请求没显式指定时
+            # 才由 session-persisted model 钉住（浏览器扩展"设一次持续生效"语义）。
+            and not (request_model or request_provider)
+        ):
             # Luma patch: 会话默认 model 别名 "hermes-agent" 会覆盖 profile 已解析的
             # 真实模型（如 yuexi profile 的 deepseek-ai/DeepSeek-V4-Flash）。
             # 当会话没有显式持久化模型（仅默认别名）且 profile 已解析出真实模型时，
@@ -2575,8 +2616,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     # the previous global provider's credentials.
                     required=bool(request_provider) or confirmed_runtime_lock,
                 )
-            if provider_runtime:
+            if provider_runtime and _runtime_has_usable_key(provider_runtime):
                 _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+            elif provider_runtime:
+                # 解析出的 runtime 没有可用 api_key（裸 custom 落到通用默认如
+                # openrouter，api_key=None/'no-key-required'）→ 丢弃，保留 profile
+                # 已解析好的凭据，否则覆盖成 Bearer None 上游 401（2026-08-10）。
+                pass
             elif effective_provider and effective_provider != current_provider:
                 runtime_kwargs["provider"] = effective_provider
             model = effective_model
@@ -2594,6 +2640,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     route_provider or "",
                     request_provider or "",
                 )
+
+        # 每请求 api_mode/base_url 覆盖（前端档位跨协议切换，如 qnaigc Claude↔GLM：
+        # anthropic 走裸域名、chat_completions 走 /v1）。
+        # runtime_kwargs 的 api_mode/base_url 是 profile 默认解析出来的；请求显式指定
+        # 则无条件胜出（_RUNTIME_AGENT_OVERRIDE_KEYS 已含两者，client 构造时会消费）。
+        if requested_api_mode:
+            runtime_kwargs["api_mode"] = requested_api_mode
+        if requested_base_url:
+            runtime_kwargs["base_url"] = requested_base_url
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
@@ -3151,7 +3206,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(session_id) > self._MAX_SESSION_HEADER_LEN:
             return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
 
-        model = body.get("model") or self._model_name
+        # 只烘焙客户端显式选择的模型（POST /api/sessions {"model": ...}）作为会话的
+        # standing choice。未显式指定（如 Luma 薄转发建会话）→ 存空，会话不钉模型：
+        # 每轮从 profile 默认或每请求 model 覆盖解析。否则烘焙的默认会被当作
+        # session-persisted model 压住每请求覆盖，档位切换失效（2026-08-10）。
+        model = body.get("model") or ""
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
@@ -5842,6 +5901,8 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
+        requested_api_mode: Optional[str] = None,
+        requested_base_url: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
@@ -5900,6 +5961,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         requested_model=requested_model,
                         requested_provider=requested_provider,
+                        requested_api_mode=requested_api_mode,
+                        requested_base_url=requested_base_url,
                         model_options=model_options,
                         route=route,
                         session_model=session_model,
