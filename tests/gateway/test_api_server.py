@@ -2725,6 +2725,73 @@ class TestRequestApiModeOverride:
 
         assert captured["model"] == "glm-5.2"
 
+    def test_session_persisted_keeps_good_creds_when_resolve_returns_keyless(
+        self, monkeypatch
+    ):
+        """会话钉住分支重解析不得用无 key 的 runtime 覆盖 profile 凭据。
+
+        根因（2026-08-10）：会话钉住 claude-sonnet-4-6 且无每请求覆盖 → 会话钉住
+        分支用 runtime 标签 ``provider="custom"`` 重解析 → 裸 custom 落到通用默认
+        （openrouter / api_key=''）→ 旧代码无条件 apply，把 qnaigc 的 base_url/
+        api_key 覆盖掉 → 上游 401 "Missing Authentication header"。
+
+        修复两件事：① 重解析优先用真实 provider 名（requested_provider=qnaigc）
+        而非标签；② 解析出的 runtime 无可用 key 时丢弃，保留 profile 已解析好的凭据。
+        """
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        # profile 已解析好的凭据（qnaigc 命名 provider）：requested_provider=真实名，
+        # provider=runtime 标签 "custom"，base_url/api_key 是好的。
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "custom",
+                "requested_provider": "qnaigc",
+                "api_key": "sk-qnaigc-real",
+                "base_url": "https://api.qnaigc.com",
+                "api_mode": "anthropic_messages",
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.run._resolve_gateway_model", lambda: "claude-sonnet-4-6"
+        )
+        resolved_with: dict = {}
+
+        def _fake_resolve(provider, target_model=None):
+            resolved_with["provider"] = provider
+            # 模拟裸 custom → openrouter / 无 key（_runtime_has_usable_key 应拦截）
+            return {
+                "provider": "custom",
+                "api_key": "",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "anthropic_messages",
+            }
+
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+            _fake_resolve,
+        )
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        adapter._create_agent(
+            session_id="s1",
+            session_model="claude-sonnet-4-6",  # 会话钉住 Claude，无每请求覆盖
+        )
+
+        # ① 重解析目标应为真实 provider 名，而非 runtime 标签 "custom"
+        assert resolved_with["provider"] == "qnaigc"
+        # ② 无 key 的 openrouter runtime 被守卫丢弃 → qnaigc 凭据原样保留
+        assert captured["base_url"] == "https://api.qnaigc.com"
+        assert captured["api_key"] == "sk-qnaigc-real"
+        assert captured["model"] == "claude-sonnet-4-6"
+
 
 class TestSessionCreateNoBakedDefaultModel:
     """薄转发（Luma）建会话不传 model 时不得烘焙 profile 默认。

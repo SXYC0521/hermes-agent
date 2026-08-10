@@ -2543,13 +2543,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if session_override:
             override_model = resolve_effective_model(session_override, None, model)
             session_provider = _clean_request_string(session_override.get("provider"))
-            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            # 重解析目标优先用真实 provider 名（requested_provider，如 qnaigc）而非
+            # runtime 标签（provider="custom"）——标签解析会落到通用默认（openrouter/
+            # 无 key），覆盖掉 profile 已解析好的凭据（2026-08-10 Bearer None 401）。
+            current_provider = _clean_request_string(
+                runtime_kwargs.get("requested_provider")
+                or runtime_kwargs.get("provider")
+            )
             provider_runtime = _resolve_provider_runtime(
                 session_provider or current_provider,
                 target_model=override_model,
                 required=False,
             )
-            if provider_runtime:
+            if provider_runtime and _runtime_has_usable_key(provider_runtime):
                 _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
             _apply_runtime_agent_overrides(runtime_kwargs, session_override)
             model = override_model
@@ -2579,13 +2585,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 # alias).  Pins this session's turns ahead of per-request body
                 # values — a session's chosen model is a standing selection,
                 # matching the native gateway's session-model semantics.
-                current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+                current_provider = _clean_request_string(
+                    runtime_kwargs.get("requested_provider")
+                    or runtime_kwargs.get("provider")
+                )
                 provider_runtime = _resolve_provider_runtime(
                     current_provider,
                     target_model=session_row_model,
                     required=False,
                 )
-                if provider_runtime:
+                # 与 else 分支同一守卫：runtime 无可用 api_key（裸 custom 落通用默认
+                # openrouter/无 key）时丢弃，保留 profile 已解析好的凭据，否则
+                # 覆盖成 Bearer None 上游 401（2026-08-10）。
+                if provider_runtime and _runtime_has_usable_key(provider_runtime):
                     _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
                 model = resolve_effective_model(None, session_row_model, model)
             if request_model or request_provider:
@@ -2602,7 +2614,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 effective_model = route_model or model
             else:
                 effective_model = request_model or model
-            current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+            current_provider = _clean_request_string(
+                runtime_kwargs.get("requested_provider")
+                or runtime_kwargs.get("provider")
+            )
             effective_provider = request_provider or route_provider or current_provider
             provider_runtime = None
             if effective_provider and (
