@@ -1568,6 +1568,13 @@ def _deliver_result(
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
 
+        # 薄转发架构：api_server 目标已在上方循环入队 pending_deliveries，live
+        # adapter 对该平台无 send()（HTTP request/response），尝试必然失败，且会
+        # 把失败记入 last_delivery_error 制造"投递报错"误报（真实投递由 Luma 轮询
+        # pending_deliveries 后 chat_sync 完成）。跳过 live 投递路径。
+        if str(platform_name).lower() == "api_server":
+            continue
+
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
         origin_thread = origin.get("thread_id")

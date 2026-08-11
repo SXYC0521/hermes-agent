@@ -109,7 +109,9 @@ def test_deliver_result_enqueues_api_server_target(monkeypatch, tmp_path):
     err = sched._deliver_result(
         job, "去收鱼", adapters=None, loop=None, execution_id="exec-1",
     )
-    assert err  # 投递必然失败（api_server 无法 send）
+    # api_server 入队 pending 即视为已处理：live adapter 无 send()，跳过 live
+    # 投递路径后不再产生"投递失败"误报（真实投递由 Luma 轮询 pending 完成）。
+    assert not err
 
     rows = executions.claim_pending_deliveries()
     assert len(rows) == 1
