@@ -1479,6 +1479,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
+        # 群消息观察缓存（方案 B）：chat_id → deque[{mid,name,text}]，记录群里所有消息
+        # （含未 @ 的），@ 触发时注入为全群上下文，让 Agent 能看到群里的项目讨论。
+        self._group_observe: Dict[str, collections.deque] = {}
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
@@ -2566,6 +2569,12 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
 
+        # 方案 B：观察所有群消息（未 @ 也记录，含 bot 自己与其他 bot——Agent
+        # 不像人记不住自己说过的话，需要看到群里全部发言才能连贯讨论）。
+        # require_mention 门控保证"观察不触发"（不 @ 只记录不响应），无死循环。
+        if getattr(message, "chat_type", "") == "group":
+            await self._observe_group_message(message, sender)
+
         reason = self._admit(sender, message)
         if reason is not None:
             logger.debug("[Feishu] dropping inbound event: %s", reason)
@@ -3271,6 +3280,106 @@ class FeishuAdapter(BasePlatformAdapter):
         _extra = getattr(_config, "extra", None) or {}
         return resolve_channel_prompt(_extra, chat_id, parent_id)
 
+    # ── 群消息观察（方案 B）─────────────────────────────────────────────
+    # 群里所有消息（含未 @ 的）都记入观察缓存；@ 触发时注入为全群上下文，
+    # 让 Agent 能看到群里的项目讨论，而不是只见 @ 它的那一条。
+    _GROUP_OBSERVE_MAX = 20
+    # 家庭群静态映射：union_id 后 8 位 → 名字（open_id 跨 app 无法解析，
+    # union_id 是 developer-scoped 稳定标识）。Luma 家庭飞书群专用。
+    _UNION_NAMES: dict = {
+        "6d29e491": "月汐",
+        "b25df827": "夏以昼",
+        "047d3894": "晏逸",
+        "52790637": "沈遇",
+    }
+
+    async def _observe_group_message(self, message: Any, sender: Any) -> None:
+        """记录一条群消息到观察缓存（无论是否 @ 本 bot）。"""
+        if getattr(message, "chat_type", "") != "group":
+            return
+        chat_id = getattr(message, "chat_id", "") or ""
+        if not chat_id:
+            return
+        text = self._simple_extract_text(getattr(message, "content", "") or "")
+        if not text.strip():
+            return
+        name = await self._observe_sender_name(sender)
+        # 记录 union_id（developer-scoped，跨 app 稳定）作为 bot 唯一标识，
+        # 用于静态映射显示名字（open_id 是 app-scoped，跨 app 会变/无法解析）
+        sid = getattr(sender, "sender_id", None)
+        union_id = str(getattr(sid, "union_id", None) or "") if sid is not None else ""
+        open_id = str(getattr(sid, "open_id", None) or "") if sid is not None else ""
+        # 惰性初始化：测试基建可能不走 __init__（object.__new__），getattr 兜底
+        observe = getattr(self, "_group_observe", None)
+        if observe is None:
+            observe = {}
+            self._group_observe = observe
+        dq = observe.setdefault(
+            chat_id, collections.deque(maxlen=self._GROUP_OBSERVE_MAX)
+        )
+        dq.append({
+            "mid": getattr(message, "message_id", "") or "",
+            "name": name,
+            "union_id": union_id,
+            "open_id": open_id,
+            "text": text,
+        })
+        # 诊断：记录观察到的群消息（排查缓存只留 1 条/名字解析问题）
+        logger.info(
+            "[Feishu] observe group msg chat=%s sender=%s uid=%s oid=%s text=%.40r 缓存=%d 条",
+            chat_id, name, union_id[-8:] if union_id else "-", open_id[-8:] if open_id else "-",
+            text, len(dq),
+        )
+
+    def _group_context(self, chat_id: str, exclude_mid: str = "") -> str:
+        """生成群里最近讨论的上下文文本，@ 触发时注入 Agent。"""
+        observe = getattr(self, "_group_observe", None)
+        dq = (observe or {}).get(chat_id)
+        if not dq:
+            return ""
+        lines = [
+            f"{item['name']}: {item['text']}"
+            for item in dq
+            if item["mid"] != exclude_mid
+        ]
+        if not lines:
+            return ""
+        return "[群聊上下文·最近讨论]\n" + "\n".join(lines) + "\n[/群聊上下文]"
+
+    @staticmethod
+    def _simple_extract_text(content: str) -> str:
+        """从飞书消息 content（JSON 字符串）提取纯文本。非 text 类型返回原样。"""
+        try:
+            payload = json.loads(content)
+            return str(payload.get("text", "") or "")
+        except (ValueError, TypeError):
+            return content
+
+    async def _observe_sender_name(self, sender: Any) -> str:
+        """观察缓存用的发送者名：静态映射（union_id）→ 缓存/API 解析 → open_id 尾部。"""
+        if sender is None:
+            return "群成员"
+        sid = getattr(sender, "sender_id", None)
+        open_id = str(getattr(sid, "open_id", None) or "") if sid is not None else ""
+        union_id = str(getattr(sid, "union_id", None) or "") if sid is not None else ""
+        if not open_id and not union_id:
+            return "群成员"
+        # 静态映射优先：union_id 后 8 位（跨 app 稳定），家庭群 bot/成员名
+        if union_id:
+            mapped = self._UNION_NAMES.get(union_id[-8:])
+            if mapped:
+                return mapped
+        try:
+            if open_id:
+                # _resolve_sender_name_from_api 内部先查缓存，命中则不发请求
+                is_bot = _is_bot_sender(sender)
+                name = await self._resolve_sender_name_from_api(open_id, is_bot=is_bot)
+                if name:
+                    return name
+        except Exception:
+            logger.debug("观察 sender 名解析失败 open_id=%s", open_id, exc_info=True)
+        return f"成员…{open_id[-6:]}" if open_id else "群成员"
+
     async def _process_inbound_message(
         self,
         *,
@@ -3338,6 +3447,12 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
         )
+        # 方案 B：群聊触发时注入最近全群讨论作为上下文（Agent 能看到群项目讨论）
+        if chat_type == "group" and text:
+            _group_ctx = self._group_context(chat_id, exclude_mid=message_id)
+            if _group_ctx:
+                text = f"{_group_ctx}\n\n{text}"
+
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
