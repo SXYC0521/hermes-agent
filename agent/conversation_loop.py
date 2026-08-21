@@ -6698,8 +6698,8 @@ def run_conversation(
                     continue_msg = {
                         "role": "user",
                         "content": (
-                            "[System: Continue now. Execute the required tool calls and only "
-                            "send your final answer after completing the task.]"
+                            "[System: You've said what you're going to do — go do it now. "
+                            "Run the tool calls you need, then give your final answer.]"
                         ),
                     }
                     messages.append(continue_msg)
